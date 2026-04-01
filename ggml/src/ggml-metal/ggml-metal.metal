@@ -898,6 +898,255 @@ void dequantize_iq4_xs(device const block_iq4_xs * xb, short il, thread type4x4 
     }
 }
 
+// ============================================================================
+// TurboQuant TQ3_0 support (3-bit Lloyd-Max codebook + RHT)
+// ============================================================================
+
+// Lloyd-Max 8-level codebook centroids for N(0,1)
+static constant float TQ3_0_CENTROIDS[8] = {
+    -2.1519f, -1.3439f, -0.7560f, -0.2451f,
+     0.2451f,  0.7560f,  1.3439f,  2.1519f
+};
+
+// Decision boundaries (midpoints between adjacent centroids)
+static constant float TQ3_0_BOUNDARIES[7] = {
+    -1.7479f, -1.0500f, -0.5005f, 0.0f, 0.5005f, 1.0500f, 1.7479f
+};
+
+// Deterministic sign flip pattern for randomized Hadamard transform
+static constant float tq3_signs[32] = {
+    +1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, +1.0f, -1.0f, +1.0f,
+    -1.0f, -1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f,
+    -1.0f, +1.0f, +1.0f, -1.0f, +1.0f, -1.0f, -1.0f, +1.0f
+};
+
+// Unpack 32 3-bit indices from 12 bytes (4 groups of 8 indices in 3 bytes each)
+void tq3_0_unpack_indices(device const uint8_t * qs, thread uint8_t * indices) {
+    for (int g = 0; g < 4; g++) {
+        device const uint8_t * qp = qs + g * 3;
+        thread uint8_t * idx = indices + g * 8;
+        idx[0] =  qp[0]       & 7;
+        idx[1] = (qp[0] >> 3) & 7;
+        idx[2] = ((qp[0] >> 6) | (qp[1] << 2)) & 7;
+        idx[3] = (qp[1] >> 1) & 7;
+        idx[4] = (qp[1] >> 4) & 7;
+        idx[5] = ((qp[1] >> 7) | (qp[2] << 1)) & 7;
+        idx[6] = (qp[2] >> 2) & 7;
+        idx[7] = (qp[2] >> 5) & 7;
+    }
+}
+
+// Inverse RHT: WHT butterfly + normalize + undo sign flips
+void tq3_wht32_inverse(thread float * x) {
+    // Stage 1: stride 16
+    for (int i = 0; i < 16; i++) {
+        float a = x[i];
+        float b = x[i + 16];
+        x[i] = a + b;
+        x[i + 16] = a - b;
+    }
+    // Stage 2: stride 8
+    for (int i = 0; i < 8; i++) {
+        float a = x[i];
+        float b = x[i + 8];
+        x[i] = a + b;
+        x[i + 8] = a - b;
+        float c = x[i + 16];
+        float d = x[i + 24];
+        x[i + 16] = c + d;
+        x[i + 24] = c - d;
+    }
+    // Stage 3: stride 4
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 32; j += 8) {
+            int k = i + j;
+            float a = x[k];
+            float b = x[k + 4];
+            x[k] = a + b;
+            x[k + 4] = a - b;
+        }
+    }
+    // Stage 4: stride 2
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 32; j += 4) {
+            int k = i + j;
+            float a = x[k];
+            float b = x[k + 2];
+            x[k] = a + b;
+            x[k + 2] = a - b;
+        }
+    }
+    // Stage 5: stride 1
+    for (int i = 0; i < 32; i += 2) {
+        float a = x[i];
+        float b = x[i + 1];
+        x[i] = a + b;
+        x[i + 1] = a - b;
+    }
+    // Normalize and undo sign flips
+    const float inv_sqrt32 = 0.17677669529663688f;
+    for (int j = 0; j < 32; j++) {
+        x[j] *= inv_sqrt32 * tq3_signs[j];
+    }
+}
+
+// Dequantize a full TQ3_0 block (32 values) into vals[]
+void tq3_0_dequant_block(device const block_tq3_0 *xb, thread float * vals) {
+    const float d = (float)xb->d;
+    uint8_t indices[32];
+    tq3_0_unpack_indices(xb->qs, indices);
+    for (int j = 0; j < 32; j++) {
+        vals[j] = TQ3_0_CENTROIDS[indices[j]];
+    }
+    tq3_wht32_inverse(vals);
+    for (int j = 0; j < 32; j++) {
+        vals[j] *= d;
+    }
+}
+
+template <typename type4>
+void dequantize_tq3_0_t4(device const block_tq3_0 *xb, short il, thread type4 & reg) {
+    float vals[32];
+    tq3_0_dequant_block(xb, vals);
+    for (int k = 0; k < 4; k++) {
+        reg[k] = vals[il * 4 + k];
+    }
+}
+
+// Cached version for MUL_MV with threadgroup cache
+template <typename type4>
+void dequantize_tq3_0_t4_cached(device const block_tq3_0 *xb, short il, thread type4 & reg,
+                                 threadgroup float * cache, ushort tiisg) {
+    if (tiisg == 0) {
+        float vals[32];
+        tq3_0_dequant_block(xb, vals);
+        for (int j = 0; j < 32; j++) {
+            cache[j] = vals[j];
+        }
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    for (int k = 0; k < 4; k++) {
+        reg[k] = cache[il * 4 + k];
+    }
+}
+
+// Forward RHT for quantization: sign flips + WHT butterfly + normalize
+void tq3_wht32_forward(thread float * x) {
+    // Apply sign flips FIRST
+    for (int j = 0; j < 32; j++) {
+        x[j] *= tq3_signs[j];
+    }
+    // Stage 1: stride 1
+    for (int i = 0; i < 32; i += 2) {
+        float a = x[i];
+        float b = x[i + 1];
+        x[i] = a + b;
+        x[i + 1] = a - b;
+    }
+    // Stage 2: stride 2
+    for (int i = 0; i < 2; i++) {
+        for (int j = 0; j < 32; j += 4) {
+            int k = i + j;
+            float a = x[k];
+            float b = x[k + 2];
+            x[k] = a + b;
+            x[k + 2] = a - b;
+        }
+    }
+    // Stage 3: stride 4
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 32; j += 8) {
+            int k = i + j;
+            float a = x[k];
+            float b = x[k + 4];
+            x[k] = a + b;
+            x[k + 4] = a - b;
+        }
+    }
+    // Stage 4: stride 8
+    for (int i = 0; i < 8; i++) {
+        float a = x[i];
+        float b = x[i + 8];
+        x[i] = a + b;
+        x[i + 8] = a - b;
+        float c = x[i + 16];
+        float d = x[i + 24];
+        x[i + 16] = c + d;
+        x[i + 24] = c - d;
+    }
+    // Stage 5: stride 16
+    for (int i = 0; i < 16; i++) {
+        float a = x[i];
+        float b = x[i + 16];
+        x[i] = a + b;
+        x[i + 16] = a - b;
+    }
+    // Normalize by 1/sqrt(32) only — signs already applied above
+    const float inv_sqrt32 = 0.17677669529663688f;
+    for (int j = 0; j < 32; j++) {
+        x[j] *= inv_sqrt32;
+    }
+}
+
+// TQ3_0 quantize function for set_rows kernel
+void quantize_tq3_0(device const float * src, device block_tq3_0 & dst) {
+#pragma METAL fp math_mode(safe)
+    // 1. Compute RMS scale
+    float sum_sq = 0.0f;
+    for (int j = 0; j < 32; j++) {
+        sum_sq += src[j] * src[j];
+    }
+    float rms = sqrt(sum_sq / 32.0f);
+    if (rms < 1e-10f) { rms = 1.0f; }
+
+    dst.d = rms;
+
+    // 2. Normalize and apply forward RHT
+    float rotated[32];
+    float inv_rms = 1.0f / rms;
+    for (int j = 0; j < 32; j++) {
+        rotated[j] = src[j] * inv_rms;
+    }
+    tq3_wht32_forward(rotated);
+
+    // 3. Quantize to nearest Lloyd-Max centroid
+    uint8_t indices[32];
+    for (int j = 0; j < 32; j++) {
+        float v = rotated[j];
+        uint8_t idx = 0;
+        for (int b = 0; b < 7; b++) {
+            if (v > TQ3_0_BOUNDARIES[b]) { idx = b + 1; }
+        }
+        indices[j] = idx;
+    }
+
+    // 4. Pack 3-bit indices into qs[] (4 groups of 8 indices -> 3 bytes each)
+    for (int g = 0; g < 4; g++) {
+        thread uint8_t * idx = indices + g * 8;
+        dst.qs[g * 3 + 0] = (idx[0])      | (idx[1] << 3) | (idx[2] << 6);
+        dst.qs[g * 3 + 1] = (idx[2] >> 2) | (idx[3] << 1) | (idx[4] << 4) | (idx[5] << 7);
+        dst.qs[g * 3 + 2] = (idx[5] >> 1) | (idx[6] << 2) | (idx[7] << 5);
+    }
+}
+
+// TQ3_0 dequantize for block-based flash attention (returns 16 values as float4x4)
+template <typename type4x4>
+void dequantize_tq3_0(device const block_tq3_0 * xb, short il, thread type4x4 & reg) {
+    float vals[32];
+    tq3_0_dequant_block(xb, vals);
+
+    float4x4 reg_f;
+    for (int i = 0; i < 4; i++) {
+        for (int j = 0; j < 4; j++) {
+            reg_f[i][j] = vals[il * 16 + i * 4 + j];
+        }
+    }
+    reg = (type4x4) reg_f;
+}
+
 enum ggml_sort_order {
     GGML_SORT_ORDER_ASC,
     GGML_SORT_ORDER_DESC,
@@ -3764,6 +4013,12 @@ template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_3")]] kernel mul_mv_ext_q4
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
 template [[host_name("kernel_mul_mv_ext_iq4_nl_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_iq4_nl, 32, dequantize_iq4_nl_t4>;
 
+// TQ3_0 kernels (epb = 32 for TQ3_0)
+template [[host_name("kernel_mul_mv_ext_tq3_0_f32_r1_2")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<2, block_tq3_0, 32, dequantize_tq3_0_t4>;
+template [[host_name("kernel_mul_mv_ext_tq3_0_f32_r1_3")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<3, block_tq3_0, 32, dequantize_tq3_0_t4>;
+template [[host_name("kernel_mul_mv_ext_tq3_0_f32_r1_4")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<4, block_tq3_0, 32, dequantize_tq3_0_t4>;
+template [[host_name("kernel_mul_mv_ext_tq3_0_f32_r1_5")]] kernel mul_mv_ext_q4_f32_t kernel_mul_mv_ext_q4_f32_disp<5, block_tq3_0, 32, dequantize_tq3_0_t4>;
+
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_2")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<2, block_q4_K, 256, dequantize_q4_K>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_3")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<3, block_q4_K, 256, dequantize_q4_K>;
 template [[host_name("kernel_mul_mv_ext_q4_K_f32_r1_4")]] kernel mul_mv_ext_q4x4_f32_t kernel_mul_mv_ext_q4x4_f32_disp<4, block_q4_K, 256, dequantize_q4_K>;
@@ -6402,6 +6657,18 @@ template [[host_name("kernel_flash_attn_ext_q8_0_dk320_dv256")]] kernel flash_at
 template [[host_name("kernel_flash_attn_ext_q8_0_dk512_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 512, 512>;
 template [[host_name("kernel_flash_attn_ext_q8_0_dk576_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_q8_0, 2, dequantize_q8_0, block_q8_0, 2, dequantize_q8_0, 576, 512>;
 
+// TurboQuant TQ3_0 block-based flash attention
+// nl_k = nl_v = 2: each block has 32 values, dequant returns 16 values per call (2 calls per block)
+template [[host_name("kernel_flash_attn_ext_tq3_0_dk64_dv64"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_0, 2, dequantize_tq3_0, block_tq3_0, 2, dequantize_tq3_0, 64,  64>;
+template [[host_name("kernel_flash_attn_ext_tq3_0_dk96_dv96"  )]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_0, 2, dequantize_tq3_0, block_tq3_0, 2, dequantize_tq3_0, 96,  96>;
+template [[host_name("kernel_flash_attn_ext_tq3_0_dk128_dv128")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_0, 2, dequantize_tq3_0, block_tq3_0, 2, dequantize_tq3_0, 128, 128>;
+template [[host_name("kernel_flash_attn_ext_tq3_0_dk192_dv192")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_0, 2, dequantize_tq3_0, block_tq3_0, 2, dequantize_tq3_0, 192, 192>;
+template [[host_name("kernel_flash_attn_ext_tq3_0_dk192_dv128")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_0, 2, dequantize_tq3_0, block_tq3_0, 2, dequantize_tq3_0, 192, 128>;
+template [[host_name("kernel_flash_attn_ext_tq3_0_dk256_dv256")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_0, 2, dequantize_tq3_0, block_tq3_0, 2, dequantize_tq3_0, 256, 256>;
+template [[host_name("kernel_flash_attn_ext_tq3_0_dk320_dv256")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_0, 2, dequantize_tq3_0, block_tq3_0, 2, dequantize_tq3_0, 320, 256>;
+template [[host_name("kernel_flash_attn_ext_tq3_0_dk512_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_0, 2, dequantize_tq3_0, block_tq3_0, 2, dequantize_tq3_0, 512, 512>;
+template [[host_name("kernel_flash_attn_ext_tq3_0_dk576_dv512")]] kernel flash_attn_ext_t kernel_flash_attn_ext<FA_TYPES,    block_tq3_0, 2, dequantize_tq3_0, block_tq3_0, 2, dequantize_tq3_0, 576, 512>;
+
 #undef FA_TYPES
 #undef FA_TYPES_BF
 #undef FA_TYPES_F32
@@ -7006,6 +7273,395 @@ template [[host_name("kernel_flash_attn_ext_vec_q8_0_dk576_dv512")]] kernel flas
 #undef FA_TYPES
 #undef FA_TYPES_F32
 
+// ============================================================================
+// TQ3_0 Flash Attention with WHT Caching
+// ============================================================================
+//
+// TQ3_0 uses a Walsh-Hadamard Transform (WHT) which is expensive to compute.
+// During flash attention, each TQ3_0 block is accessed multiple times (once per
+// query token in the batch). To optimize, we cache the dequantized WHT results
+// in threadgroup memory.
+//
+// This specialized kernel duplicates the flash_attn_ext_vec logic but adds
+// WHT caching for TQ3_0 blocks.
+
+template<
+    typename q4_t,
+    typename qk_t,
+    typename s_t,
+    typename s4_t,
+    typename o4_t,
+    short DK,
+    short DV,
+    short NE,
+    short Q,
+    short C>
+kernel void kernel_flash_attn_ext_vec_tq3_0(
+        constant ggml_metal_kargs_flash_attn_ext_vec & args,
+        device const char * q,
+        device const char * k,
+        device const char * v,
+        device const char * mask,
+        device const char * sinks,
+        device const char * pad,
+        device       char * dst,
+        threadgroup  half * shmem_f16 [[threadgroup(0)]],
+        uint3   tgpig[[threadgroup_position_in_grid]],
+        ushort  tiisg[[thread_index_in_simdgroup]],
+        ushort  sgitg[[simdgroup_index_in_threadgroup]]) {
+    static_assert(DK % 32 == 0, "DK must be divisible by 32");
+    static_assert(DV % 32 == 0, "DV must be divisible by 32");
+
+#define NWG  (FC_flash_attn_ext_vec_nwg)
+#define NSG  (FC_flash_attn_ext_vec_nsg)
+
+#define NS10 (FC_flash_attn_ext_vec_ns10)
+#define NS20 (FC_flash_attn_ext_vec_ns20)
+
+    const short iwg = tgpig[2]%NWG;
+
+    const ushort iq3 = tgpig[2]/NWG;
+    const ushort iq2 = tgpig[1];
+    const ushort iq1 = tgpig[0];
+
+    constexpr short DK4 = DK/4;
+    constexpr short DV4 = DV/4;
+
+    constexpr short PK  = PAD2(DK, 128);
+    constexpr short PK4 = PK/4;
+
+    constexpr short PV  = PAD2(DV, 128);
+    constexpr short PV4 = PV/4;
+
+    constexpr short NW  = N_SIMDWIDTH;
+    constexpr short NL  = NW/NE;
+    constexpr short SH  = 4*C;
+
+    static_assert(DK4 % NL == 0, "DK4 must be divisible by NL");
+    static_assert(DV4 % NL == 0, "DV4 must be divisible by NL");
+
+    // Standard flash attention shared memory layout
+    threadgroup q4_t  * sq4 = (threadgroup q4_t  *) (shmem_f16 +                      0*PK);
+    threadgroup s_t   * ss  = (threadgroup s_t   *) (shmem_f16 +   sgitg*SH       + NSG*PK);
+    threadgroup s4_t  * ss4 = (threadgroup s4_t  *) (shmem_f16 +   sgitg*SH       + NSG*PK);
+    threadgroup half  * sm  = (threadgroup half  *) (shmem_f16 +   sgitg*SH + 2*C + NSG*PK);
+    threadgroup o4_t  * so4 = (threadgroup o4_t  *) (shmem_f16 + 2*sgitg*PV       + NSG*PK + NSG*SH);
+
+    // WHT cache for TQ3_0 dequantization (32 floats = 128 bytes)
+    // Shared between K and V dequantization - one block at a time
+    threadgroup float * k_wht_cache = (threadgroup float *) (shmem_f16 + 2*NSG*PV + NSG*PK + NSG*SH + sgitg * 32);
+
+    so4 += tiisg;
+
+    {
+        q += iq1*args.nb01 + iq2*args.nb02 + iq3*args.nb03;
+
+        const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+        const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+        k += ikv2*args.nb12 + ikv3*args.nb13;
+        v += ikv2*args.nb22 + ikv3*args.nb23;
+    }
+
+    device const float4 * q4 = (device const float4 *) ((device const char *) q);
+
+    if (iq1 < args.ne01) {
+        for (short i = tiisg; i < PK4; i += NW) {
+            if (i < DK4) {
+                sq4[i] = (q4_t) q4[i];
+            } else {
+                sq4[i] = (q4_t) 0.0f;
+            }
+        }
+    }
+
+    for (short i = 0; i < DV4/NL; ++i) {
+        so4[i*NL] = (o4_t) 0.0f;
+    }
+
+    for (short i = tiisg; i < SH/4; i += NW) {
+        ss4[i] = (s4_t) 0.0f;
+    }
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    {
+        float S = 0.0f;
+        float M = -FLT_MAX/2;
+
+        const short tx = tiisg%NL;
+        const short ty = tiisg/NL;
+
+        device const half * pm = (device const half *) (mask + iq1*args.nb31 + (iq2%args.ne32)*args.nb32 + (iq3%args.ne33)*args.nb33);
+
+        float slope = 1.0f;
+
+        if (FC_flash_attn_ext_vec_has_bias) {
+            const short h = iq2;
+            const float base = h < args.n_head_log2 ? args.m0 : args.m1;
+            const short exph = h < args.n_head_log2 ? h + 1 : 2*(h - args.n_head_log2) + 1;
+            slope = pow(base, exph);
+        }
+
+        for (int ic0 = iwg*NSG + sgitg; ; ic0 += NWG*NSG) {
+            int ic = ic0*C;
+            if (ic >= args.ne11) {
+                break;
+            }
+
+            if (FC_flash_attn_ext_vec_has_kvpad && ic + C > args.ne11) {
+                k    = pad;
+                v    = k + args.nb11*C*args.ne_12_2*args.ne_12_3;
+                mask = v + args.nb21*C*args.ne_12_2*args.ne_12_3;
+
+                const short ikv2 = iq2/(args.ne02/args.ne_12_2);
+                const short ikv3 = iq3/(args.ne03/args.ne_12_3);
+
+                k += (ikv2 + ikv3*args.ne_12_2)*args.nb11*C;
+                v += (ikv2 + ikv3*args.ne_12_2)*args.nb21*C;
+
+                if (!FC_flash_attn_ext_vec_has_mask) {
+                    if (ic + tiisg >= args.ne11) {
+                        sm[tiisg] = -MAXHALF;
+                    }
+                } else {
+                    pm = (device const half *) (mask) +
+                        iq1*C +
+                        (iq2%args.ne32)*(C*args.ne31) +
+                        (iq3%args.ne33)*(C*args.ne31*args.ne32);
+                }
+
+                ic = 0;
+            }
+
+            if (FC_flash_attn_ext_vec_has_mask) {
+                sm[tiisg] = pm[ic + tiisg];
+            }
+
+            if (simd_max(sm[tiisg]) <= -MAXHALF) {
+                continue;
+            }
+
+            // Q*K^T with TQ3_0 proper inverse WHT and threadgroup caching
+            {
+                qk_t mqk[C/NE] = { [ 0 ... C/NE - 1] = 0.0f };
+
+                FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                    device const block_tq3_0 * pk = (device const block_tq3_0 *) (k + ((ic + NE*cc + ty)*args.nb11));
+
+                    FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
+                        const short i = ii*NL + tx;
+                        const short block_idx = i / 8;
+
+                        if (tiisg == 0) {
+                            float vals[32];
+                            tq3_0_dequant_block(pk + block_idx, vals);
+                            for (int j = 0; j < 32; j++) {
+                                k_wht_cache[j] = vals[j];
+                            }
+                        }
+
+                        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                        const short local_off = (i % 8) * 4;
+                        float4 mk;
+                        for (int k_idx = 0; k_idx < 4; k_idx++) {
+                            mk[k_idx] = k_wht_cache[local_off + k_idx];
+                        }
+
+                        mqk[cc] += dot((float4) mk, (float4) sq4[i]);
+                    }
+
+                    if (NE == 1) {
+                        mqk[cc] = simd_sum(mqk[cc]);
+                    } else {
+                        if (NE <= 1) mqk[cc] += simd_shuffle_down(mqk[cc], 16);
+                        if (NE <= 2) mqk[cc] += simd_shuffle_down(mqk[cc],  8);
+                        if (NE <= 4) mqk[cc] += simd_shuffle_down(mqk[cc],  4);
+                        if (NE <= 8) mqk[cc] += simd_shuffle_down(mqk[cc],  2);
+                        if (NE <= 16) mqk[cc] += simd_shuffle_down(mqk[cc],  1);
+                        mqk[cc] = simd_shuffle(mqk[cc], NL*ty);
+                    }
+                }
+
+                if (FC_flash_attn_ext_vec_has_mask && !FC_flash_attn_ext_vec_has_scap && !FC_flash_attn_ext_vec_has_bias) {
+                    ss[NE*tx + ty] = fma(mqk[tx], (qk_t) args.scale, (qk_t) sm[NE*tx + ty]);
+                } else {
+                    mqk[tx] *= args.scale;
+                    if (FC_flash_attn_ext_vec_has_scap) {
+                        mqk[tx] = args.logit_softcap*precise::tanh(mqk[tx]);
+                    }
+                    if (FC_flash_attn_ext_vec_has_bias) {
+                        mqk[tx] += (qk_t) sm[NE*tx + ty]*slope;
+                    } else {
+                        mqk[tx] += (qk_t) sm[NE*tx + ty];
+                    }
+                    ss[NE*tx + ty] = mqk[tx];
+                }
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // online softmax
+            {
+                const float m = M;
+                const float s = ss[tiisg];
+
+                M = simd_max(max(M, s));
+
+                const float ms = exp(m - M);
+                const float vs = exp(s - M);
+
+                S = S*ms + simd_sum(vs);
+
+                ss[tiisg] = vs;
+
+                if ((DV4/NL % NW == 0) || ty == 0) {
+                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                        so4[ii*NL] *= ms;
+                    }
+                }
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+
+            // O = O + (Q*K^T)*V with TQ3_0 proper inverse WHT and threadgroup caching
+            {
+                o4_t lo[DV4/NL];
+                FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    lo[ii] = 0.0f;
+                }
+
+                FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
+                    device const block_tq3_0 * pv = (device const block_tq3_0 *) (v + ((ic + NE*cc + ty)*args.nb21));
+
+                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                        const short i = ii*NL + tx;
+                        const short block_idx = i / 8;
+
+                        if (tiisg == 0) {
+                            float vals[32];
+                            tq3_0_dequant_block(pv + block_idx, vals);
+                            for (int j = 0; j < 32; j++) {
+                                k_wht_cache[j] = vals[j];
+                            }
+                        }
+
+                        simdgroup_barrier(mem_flags::mem_threadgroup);
+
+                        const short local_off = (i % 8) * 4;
+                        float4 mv;
+                        for (int v_idx = 0; v_idx < 4; v_idx++) {
+                            mv[v_idx] = k_wht_cache[local_off + v_idx];
+                        }
+
+                        lo[ii] += ss[NE*tx + ty] * (o4_t) mv;
+                    }
+                }
+
+                if ((DV4/NL % NW == 0) || ty == 0) {
+                    FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                        so4[ii*NL] += lo[ii];
+                    }
+                }
+            }
+
+            simdgroup_barrier(mem_flags::mem_threadgroup);
+        }
+
+        if (FC_flash_attn_ext_vec_has_sinks && sgitg == 0 && iwg == 0) {
+            const float m = M;
+            const float s = tiisg == 0 ? ((device const float *) sinks)[iq2] : -FLT_MAX/2;
+
+            M = simd_max(max(M, s));
+
+            const float ms = exp(m - M);
+            const float vs = exp(s - M);
+
+            S = S*ms + simd_sum(vs);
+
+            if ((DV4/NL % NW == 0) || ty == 0) {
+                FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
+                    so4[ii*NL] *= ms;
+                }
+            }
+        }
+
+        if (tiisg == 0) {
+            ss[0] = (s_t) S;
+            ss[1] = (s_t) M;
+        }
+    }
+
+    so4 -= tiisg;
+
+    threadgroup_barrier(mem_flags::mem_threadgroup);
+
+    // parallel reduce
+    for (short r = NSG/2; r > 0; r >>= 1) {
+        if (sgitg < r) {
+            const float S0 = ss[           0];
+            const float S1 = ss[r*(SH/2) + 0];
+            const float M0 = ss[           1];
+            const float M1 = ss[r*(SH/2) + 1];
+
+            const float M = max(M0, M1);
+            const float ms0 = exp(M0 - M);
+            const float ms1 = exp(M1 - M);
+            const float S = S0*ms0 + S1*ms1;
+
+            if (tiisg == 0) {
+                ss[0] = S;
+                ss[1] = M;
+            }
+
+            for (short i = tiisg; i < DV4; i += NW) {
+                so4[i] = so4[i]*ms0 + so4[i + r*PV4]*ms1;
+            }
+        }
+
+        threadgroup_barrier(mem_flags::mem_threadgroup);
+    }
+
+    // store results
+    if (iq1 < args.ne01) {
+        device float4 * dst4 = (device float4 *) dst + ((uint64_t)iq3*args.ne2*args.ne1 + iq2 + (uint64_t)iq1*args.ne1)*DV4;
+
+        const float S = ss[0];
+        const float S_inv = 1.0f/S;
+
+        for (short ii = 0; ii < DV4/NL; ++ii) {
+            const short i = ii*NL + tiisg;
+
+            float4 r = (float4) so4[i];
+
+            r *= S_inv;
+
+            dst4[i] = r;
+        }
+    }
+
+#undef NWG
+#undef NSG
+#undef NS10
+#undef NS20
+}
+
+// TQ3_0 flash attention kernel instantiations
+// These kernels use specialized WHT caching for TQ3_0
+//
+// NB: For TQ3_0, nl_k = 8 (32/4 = 8 blocks)
+// The kernel adds 64 floats per simdgroup for WHT caching (32 for K + 32 for V)
+
+typedef decltype(kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 64, 64, 2, 4, 16>) flash_attn_ext_vec_tq3_0_t;
+
+template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk64_dv64")]]   kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4,  64,  64, 2, 4, 16>;
+template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk96_dv96")]]   kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4,  96,  96, 4, 4, 16>;
+template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk128_dv128")]] kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 128, 128, 1, 4, 16>;
+template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk192_dv192")]] kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 192, 192, 2, 4, 16>;
+template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk192_dv128")]] kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 192, 128, 2, 4, 16>;
+template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk256_dv256")]] kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 256, 256, 1, 4, 16>;
+
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
 
@@ -7138,6 +7794,7 @@ template [[host_name("kernel_cpy_f32_q4_1")]]   kernel cpy_f_q_t kernel_cpy_f32_
 template [[host_name("kernel_cpy_f32_q5_0")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_0,  block_q5_0,   quantize_q5_0>;
 template [[host_name("kernel_cpy_f32_q5_1")]]   kernel cpy_f_q_t kernel_cpy_f32_q<QK5_1,  block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_cpy_f32_iq4_nl")]] kernel cpy_f_q_t kernel_cpy_f32_q<QK4_NL, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_cpy_f32_tq3_0")]]  kernel cpy_f_q_t kernel_cpy_f32_q<32,     block_tq3_0,  quantize_tq3_0>;
 
 template<typename T4x4, typename block_q, short nl, void (*dequantize_func)(device const block_q *, short, thread T4x4 &)>
 kernel void kernel_cpy_q_f32(
@@ -7184,6 +7841,8 @@ template [[host_name("kernel_cpy_q4_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<
 template [[host_name("kernel_cpy_q5_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_0, 2, dequantize_q5_0>;
 template [[host_name("kernel_cpy_q5_1_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q5_1, 2, dequantize_q5_1>;
 template [[host_name("kernel_cpy_q8_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4, block_q8_0, 2, dequantize_q8_0>;
+template [[host_name("kernel_cpy_tq3_0_f32")]] kernel cpy_q_f_t kernel_cpy_q_f32<float4x4, block_tq3_0, 2, dequantize_tq3_0>;
+template [[host_name("kernel_cpy_tq3_0_f16")]] kernel cpy_q_f_t kernel_cpy_q_f32<half4x4,  block_tq3_0, 2, dequantize_tq3_0>;
 
 kernel void kernel_concat(
     constant ggml_metal_kargs_concat & args,
@@ -9782,6 +10441,7 @@ template [[host_name("kernel_get_rows_q5_0")]]    kernel get_rows_q_t kernel_get
 template [[host_name("kernel_get_rows_q5_1")]]    kernel get_rows_q_t kernel_get_rows_q<block_q5_1,    2, dequantize_q5_1>;
 template [[host_name("kernel_get_rows_q8_0")]]    kernel get_rows_q_t kernel_get_rows_q<block_q8_0,    2, dequantize_q8_0>;
 template [[host_name("kernel_get_rows_mxfp4")]]   kernel get_rows_q_t kernel_get_rows_q<block_mxfp4,   2, dequantize_mxfp4>;
+template [[host_name("kernel_get_rows_tq3_0")]]   kernel get_rows_q_t kernel_get_rows_q<block_tq3_0,   2, dequantize_tq3_0>;
 template [[host_name("kernel_get_rows_q2_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q2_K,    QK_NL, dequantize_q2_K>;
 template [[host_name("kernel_get_rows_q3_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q3_K,    QK_NL, dequantize_q3_K>;
 template [[host_name("kernel_get_rows_q4_K")]]    kernel get_rows_q_t kernel_get_rows_q<block_q4_K,    QK_NL, dequantize_q4_K>;
@@ -9826,6 +10486,8 @@ template [[host_name("kernel_set_rows_q5_1_i64")]]   kernel set_rows_q32_t kerne
 template [[host_name("kernel_set_rows_q5_1_i32")]]   kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_q5_1,   quantize_q5_1>;
 template [[host_name("kernel_set_rows_iq4_nl_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_iq4_nl, quantize_iq4_nl>;
 template [[host_name("kernel_set_rows_iq4_nl_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_iq4_nl, quantize_iq4_nl>;
+template [[host_name("kernel_set_rows_tq3_0_i64")]] kernel set_rows_q32_t kernel_set_rows_q32<int64_t, block_tq3_0, quantize_tq3_0>;
+template [[host_name("kernel_set_rows_tq3_0_i32")]] kernel set_rows_q32_t kernel_set_rows_q32<int32_t, block_tq3_0, quantize_tq3_0>;
 
 //
 // matrix-matrix multiplication

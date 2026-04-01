@@ -266,6 +266,19 @@ typedef struct {
 } block_tq2_0;
 static_assert(sizeof(block_tq2_0) == sizeof(ggml_half) + QK_K / 4, "wrong tq2_0 block size/padding");
 
+// TurboQuant 3-bit quantization (3.5 bpw)
+// WHT rotation + 3-bit Lloyd-Max codebook for N(0,1)
+// Each block of 32 values is quantized as:
+//   - FP16 RMS scale factor
+//   - 32 × 3-bit indices into 8-level Lloyd-Max codebook (packed into 12 bytes)
+// Based on Aaryan Kapoor's reference implementation
+#define QK_TQ3_0 32
+typedef struct {
+    ggml_half d;                       // RMS scale factor (2 bytes)
+    uint8_t   qs[QK_TQ3_0 * 3 / 8];   // 3-bit codebook indices, 32 × 3 bits = 12 bytes
+} block_tq3_0;
+static_assert(sizeof(block_tq3_0) == sizeof(ggml_half) + QK_TQ3_0 * 3 / 8, "wrong tq3_0 block size/padding");
+
 //
 // Super-block quantization structures
 //

@@ -2953,6 +2953,26 @@ llama_context * llama_init_from_model(
         }
     }
 
+    // TQ3_0 K cache: native Metal FA kernels produce incorrect results, but with
+    // kernel_cpy_tq3_0_f32/f16 now available, graph-side dequant to F16 before FA
+    // is used instead. Keep FA enabled so V cache uses non-transposed storage
+    // (required for block-quantized V scatter via kernel_set_rows_tq3_0).
+    // Validate V block size first (since promoting AUTO→ENABLED skips the check below).
+    if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && params.type_k == GGML_TYPE_TQ3_0) {
+        if (ggml_is_quantized(params.type_v)) {
+            const uint32_t blck_size = ggml_blck_size(params.type_v);
+            for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {
+                if (model->hparams.n_embd_head_v(il) % blck_size != 0) {
+                    LLAMA_LOG_ERROR("%s: V cache type %s with block size %u does not divide n_embd_head_v=%u\n",
+                        __func__, ggml_type_name(params.type_v), blck_size, model->hparams.n_embd_head_v(il));
+                    return nullptr;
+                }
+            }
+        }
+        LLAMA_LOG_INFO("%s: TQ3_0 K cache - FA enabled with graph-side dequant to F16\n", __func__);
+        params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
+    }
+
     if (params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO && ggml_is_quantized(params.type_v)) {
         const uint32_t blck_size = ggml_blck_size(params.type_v);
         for (uint32_t il = 0; il < model->hparams.n_layer; ++il) {

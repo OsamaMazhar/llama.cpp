@@ -2052,9 +2052,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q5_0 ||
            op->src[0]->type == GGML_TYPE_Q5_1 ||
            op->src[0]->type == GGML_TYPE_Q8_0 ||
-           op->src[0]->type == GGML_TYPE_MXFP4 ||
-           op->src[0]->type == GGML_TYPE_IQ4_NL ||
-           false) && (ne11 >= 2 && ne11 <= 8)
+            op->src[0]->type == GGML_TYPE_MXFP4 ||
+            op->src[0]->type == GGML_TYPE_IQ4_NL ||
+            op->src[0]->type == GGML_TYPE_TQ3_0 ||
+            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (
           (
@@ -2918,7 +2919,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // ne20*(nsg)
         // each simdgroup has a full f32 head vector in shared mem to accumulate results
         //
-#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2), 16))
+        // For TQ3_0, add extra space for WHT cache: 32 floats per simdgroup (shared between K and V)
+#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg) + \
+                                    (op->src[1]->type == GGML_TYPE_TQ3_0 ? 32*(nsg) : 0))*(sizeof(float)/2), 16))
 
         int64_t nsg = 1;
 

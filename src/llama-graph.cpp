@@ -1802,6 +1802,8 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
     ggml_tensor * cur;
 
+    // TQ3_0: native Metal FA kernels produce incorrect results, so dequant K/V
+    // to F16 at graph level and use standard F16 FA kernels instead.
     const bool use_flash_attn = cparams.flash_attn && kq_b == nullptr;
     if (use_flash_attn) {
         GGML_ASSERT(kq_b == nullptr && "Flash attention does not support KQ bias yet");
@@ -1810,7 +1812,14 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // this can happen when KV cache is not used (e.g. an embedding model with non-causal attn)
+        // Dequant TQ3_0 K/V to F16 for FA (native TQ3_0 FA kernels are broken)
+        if (k->type == GGML_TYPE_TQ3_0) {
+            k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+        }
+        if (v->type == GGML_TYPE_TQ3_0) {
+            v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+
         if (k->type == GGML_TYPE_F32) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
