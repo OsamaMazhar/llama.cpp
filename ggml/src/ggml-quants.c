@@ -2278,6 +2278,46 @@ size_t quantize_tq2_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst,
     return nrow * row_size;
 }
 
+void quantize_row_tq3_0_ref(const float * GGML_RESTRICT x, block_tq3_0 * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    const int64_t nb = k / QK_TQ3_0;
+    for (int64_t i = 0; i < nb; i++) {
+        float amax = 0.0f;
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            amax = MAX(amax, fabsf(x[i * QK_TQ3_0 + j]));
+        }
+        const float d = amax;
+        const float id = d ? 1.0f / d : 0.0f;
+        y[i].d = GGML_FP32_TO_FP16(d);
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        memset(y[i].qr, 0, sizeof(y[i].qr));
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            int q = lroundf(x[i * QK_TQ3_0 + j] * id) + 1;
+            q = q < 0 ? 0 : (q > 3 ? 3 : q);
+            y[i].qs[j / 4] |= (q & 0x3) << ((j % 4) * 2);
+        }
+    }
+}
+
+size_t quantize_tq3_0(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrow, int64_t n_per_row, const float * quant_weights) {
+    (void)quant_weights;
+    const size_t row_size = ggml_row_size(GGML_TYPE_TQ3_0, n_per_row);
+    quantize_row_tq3_0_ref(src, dst, (int64_t)nrow*n_per_row);
+    return nrow * row_size;
+}
+
+void dequantize_row_tq3_0(const block_tq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    assert(k % QK_TQ3_0 == 0);
+    const int64_t nb = k / QK_TQ3_0;
+    for (int64_t i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < QK_TQ3_0; j++) {
+            const int q = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x3;
+            y[i * QK_TQ3_0 + j] = (q - 1) * d;
+        }
+    }
+}
+
 void dequantize_row_tq1_0(const block_tq1_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
     assert(k % QK_K == 0);
     const int64_t nb = k / QK_K;

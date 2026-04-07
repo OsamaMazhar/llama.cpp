@@ -1408,16 +1408,25 @@ struct clip_model_loader {
                         get_u32(KEY_SAM_N_EMBD, hparams.sam_n_embd, true);
                         get_u32(KEY_ATTN_WINDOW_SIZE, hparams.attn_window_size, true);
                      } break;
-                case PROJECTOR_TYPE_LFM2A:
-                    {
-                        // audio preprocessing params
-                        hparams.audio_chunk_len        = 1; // in seconds
-                        hparams.audio_sample_rate      = 16000;
-                        hparams.audio_n_fft            = 512;
-                        hparams.audio_window_len       = 400;
-                        hparams.audio_hop_len          = 160;
-                    } break;
-                case PROJECTOR_TYPE_JANUS_PRO:
+                 case PROJECTOR_TYPE_LFM2A:
+                     {
+                         // audio preprocessing params
+                         hparams.audio_chunk_len        = 1; // in seconds
+                         hparams.audio_sample_rate      = 16000;
+                         hparams.audio_n_fft            = 512;
+                         hparams.audio_window_len       = 400;
+                         hparams.audio_hop_len          = 160;
+                     } break;
+                 case PROJECTOR_TYPE_GEMMA4A:
+                     {
+                         // audio preprocessing params for Gemma 4
+                         hparams.audio_chunk_len        = 30; // in seconds (max)
+                         hparams.audio_sample_rate      = 16000;
+                         hparams.audio_n_fft            = 400;
+                         hparams.audio_window_len       = 400;
+                         hparams.audio_hop_len          = 160;
+                     } break;
+                 case PROJECTOR_TYPE_JANUS_PRO:
                     {
                         hparams.image_pad_color   = {127, 127, 127};
                         hparams.image_resize_algo = RESIZE_ALGO_BILINEAR;
@@ -2437,8 +2446,7 @@ struct clip_init_result clip_init(const char * fname, struct clip_context_params
 
             // TODO: we don't support audio for Gemma 3N, but GGUF contains audio tensors
             // we can remove this check when we implement audio support for Gemma 3N
-            skip_audio = ctx_vision->model.proj_type == PROJECTOR_TYPE_GEMMA3NV
-                || ctx_vision->model.proj_type == PROJECTOR_TYPE_GEMMA4V;
+            skip_audio = ctx_vision->model.proj_type == PROJECTOR_TYPE_GEMMA3NV;
         }
 
         if (loader.has_audio && !skip_audio) {
