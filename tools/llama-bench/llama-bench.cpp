@@ -483,9 +483,6 @@ static ggml_type ggml_type_from_name(const std::string & s) {
     if (s == "iq4_nl") {
         return GGML_TYPE_IQ4_NL;
     }
-    if (s == "tq3_0") {
-        return GGML_TYPE_TQ3_0;
-    }
 
     return GGML_TYPE_COUNT;
 }
@@ -1810,7 +1807,7 @@ struct markdown_printer : public printer {
         if (!is_cpu_backend) {
             fields.emplace_back("n_gpu_layers");
         }
-        if (params.n_cpu_moe.size() > 1) {
+        if (params.n_cpu_moe.size() > 1 || params.n_cpu_moe != cmd_params_defaults.n_cpu_moe) {
             fields.emplace_back("n_cpu_moe");
         }
         if (params.n_threads.size() > 1 || params.n_threads != cmd_params_defaults.n_threads || is_cpu_backend) {

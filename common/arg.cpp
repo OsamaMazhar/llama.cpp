@@ -387,7 +387,6 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
-    GGML_TYPE_TQ3_0,
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -423,6 +422,9 @@ static bool parse_bool_value(const std::string & value) {
 
 static bool common_params_parse_ex(int argc, char ** argv, common_params_context & ctx_arg) {
     common_params & params = ctx_arg.params;
+
+    // setup log directly from params.verbosity: see tools/cli/cli.cpp
+    common_log_set_verbosity_thold(params.verbosity);
 
     std::unordered_map<std::string, std::pair<common_arg *, bool>> arg_to_options;
     for (auto & opt : ctx_arg.options) {
@@ -535,9 +537,11 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     } catch (const std::exception & e) {
         LOG_WRN("HF cache migration failed: %s\n", e.what());
     }
+    // export_graph_ops loads only metadata
+    const bool skip_model_download = ctx_arg.ex == LLAMA_EXAMPLE_EXPORT_GRAPH_OPS;
 
     // maybe handle remote preset
-    if (!params.model.hf_repo.empty()) {
+    if (!params.model.hf_repo.empty() && !skip_model_download) {
         std::string cli_hf_repo = params.model.hf_repo;
         bool has_preset = common_params_handle_remote_preset(params, ctx_arg.ex);
 
@@ -568,7 +572,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
     }
 
     // handle model and download
-    {
+    if (!skip_model_download) {
         auto res = common_params_handle_model(params.model, params.hf_token, params.offline);
         if (params.no_mmproj) {
             params.mmproj = {};
@@ -589,7 +593,7 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
 
     // model is required (except for server)
     // TODO @ngxson : maybe show a list of available models in CLI in this case
-    if (params.model.path.empty() && ctx_arg.ex != LLAMA_EXAMPLE_SERVER && !params.usage && !params.completion) {
+    if (params.model.path.empty() && ctx_arg.ex != LLAMA_EXAMPLE_SERVER && !skip_model_download && !params.usage && !params.completion) {
         throw std::invalid_argument("error: --model is required\n");
     }
 
@@ -631,8 +635,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
             params.use_jinja ? "" : "\nnote: llama.cpp was started without --jinja, we only support commonly used templates"
         ));
     }
-
-    common_log_set_verbosity_thold(params.verbosity);
 
     return true;
 }
@@ -1079,7 +1081,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.verbose_prompt = true;
         }
-    ));
+    ).set_examples({LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI, LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL}));
     add_opt(common_arg(
         {"--display-prompt"},
         {"--no-display-prompt"},
@@ -2808,6 +2810,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_PORT"));
     add_opt(common_arg(
+        {"--reuse-port"},
+        string_format("allow multiple sockets to bind to the same port (default: %s)", params.reuse_port ? "enabled" : "disabled"),
+        [](common_params & params) {
+            params.reuse_port = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_REUSE_PORT"));
+    add_opt(common_arg(
         {"--path"}, "PATH",
         string_format("path to serve static files from (default: %s)", params.public_path.c_str()),
         [](common_params & params, const std::string & value) {
@@ -2843,6 +2852,15 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.webui_mcp_proxy = value;
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_WEBUI_MCP_PROXY"));
+    add_opt(common_arg(
+        {"--tools"}, "TOOL1,TOOL2,...",
+        "experimental: whether to enable built-in tools for AI agents - do not enable in untrusted environments (default: no tools)\n"
+        "specify \"all\" to enable all tools\n"
+        "available tools: read_file, file_glob_search, grep_search, exec_shell_command, write_file, edit_file, apply_diff",
+        [](common_params & params, const std::string & value) {
+            params.server_tools = parse_csv_row(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_TOOLS"));
     add_opt(common_arg(
         {"--webui"},
         {"--no-webui"},
@@ -3245,6 +3263,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         "Set verbosity level to infinity (i.e. log all messages, useful for debugging)",
         [](common_params & params) {
             params.verbosity = INT_MAX;
+            common_log_set_verbosity_thold(INT_MAX);
         }
     ));
     add_opt(common_arg(
@@ -3265,6 +3284,7 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             "(default: %d)\n", params.verbosity),
         [](common_params & params, int value) {
             params.verbosity = value;
+            common_log_set_verbosity_thold(value);
         }
     ).set_env("LLAMA_LOG_VERBOSITY"));
     add_opt(common_arg(
