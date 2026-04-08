@@ -1879,11 +1879,11 @@ ggml_tensor * llm_graph_context::build_attn_mha(
             v = ggml_transpose(ctx0, v);
         }
 
-        // Dequant TQ3_0 K/V to F16 for FA (native TQ3_0 FA kernels are broken)
-        if (k->type == GGML_TYPE_TQ3_0) {
+        // Dequant TQ3_0/TQ1_0 K/V to F16 for FA (native TQ FA kernels are broken/unsupported)
+        if (k->type == GGML_TYPE_TQ3_0 || k->type == GGML_TYPE_TQ1_0) {
             k = ggml_cast(ctx0, k, GGML_TYPE_F16);
         }
-        if (v->type == GGML_TYPE_TQ3_0) {
+        if (v->type == GGML_TYPE_TQ3_0 || v->type == GGML_TYPE_TQ1_0) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
         }
 
@@ -1893,6 +1893,18 @@ ggml_tensor * llm_graph_context::build_attn_mha(
 
         if (v->type == GGML_TYPE_F32) {
             v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+        }
+
+        // Ensure K and V types match for FA (required by Metal backend).
+        // This handles mixed KV cache configs (e.g. TQ3_0/TQ1_0 K + Q8_0 V):
+        // after the TQ dequant above, K becomes F16 but V stays Q8_0,
+        // which Metal FA rejects since it requires src[1]->type == src[2]->type.
+        if (k->type != v->type) {
+            if (k->type == GGML_TYPE_F16 && v->type != GGML_TYPE_F16) {
+                v = ggml_cast(ctx0, v, GGML_TYPE_F16);
+            } else if (v->type == GGML_TYPE_F16 && k->type != GGML_TYPE_F16) {
+                k = ggml_cast(ctx0, k, GGML_TYPE_F16);
+            }
         }
 
         cur = ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, hparams.f_max_alibi_bias,
