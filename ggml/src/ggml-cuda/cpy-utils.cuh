@@ -211,6 +211,102 @@ static __device__ void cpy_blck_f32_iq4_nl(const char * cxi, char * cdsti) {
     quantize_f32_iq4_nl_block((const float *)cxi, (block_iq4_nl *)cdsti);
 }
 
+// TQ3_0: Device-side Randomized Hadamard Transform (RHT32)
+// Sign pattern from golden ratio hash (must match CPU)
+static __device__ __forceinline__ void tq3_wht32_forward_device(float * x) {
+    const int8_t signs[32] = {
+        +1, -1, +1, -1, +1, +1, -1, +1, -1, -1, +1, +1, -1, +1, +1, -1,
+        +1, +1, -1, -1, +1, -1, +1, +1, -1, +1, -1, +1, +1, -1, -1, +1
+    };
+    for (int j = 0; j < 32; j++) x[j] *= signs[j];
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step * 2) {
+            for (int j = i; j < i + step; j++) {
+                float a = x[j], b = x[j + step];
+                x[j] = a + b; x[j + step] = a - b;
+            }
+        }
+    }
+    const float s = 0.17677669529663688f;  // 1/sqrt(32)
+    for (int j = 0; j < 32; j++) x[j] *= s;
+}
+
+static __device__ __forceinline__ void tq3_wht32_inverse_device(float * x) {
+    for (int step = 1; step < 32; step <<= 1) {
+        for (int i = 0; i < 32; i += step * 2) {
+            for (int j = i; j < i + step; j++) {
+                float a = x[j], b = x[j + step];
+                x[j] = a + b; x[j + step] = a - b;
+            }
+        }
+    }
+    const int8_t signs[32] = {
+        +1, -1, +1, -1, +1, +1, -1, +1, -1, -1, +1, +1, -1, +1, +1, -1,
+        +1, +1, -1, -1, +1, -1, +1, +1, -1, +1, -1, +1, +1, -1, -1, +1
+    };
+    const float s = 0.17677669529663688f;
+    for (int j = 0; j < 32; j++) x[j] *= s * signs[j];
+}
+
+// TQ3_0: Unpack 8 3-bit indices from 3 bytes
+static __device__ __forceinline__ void tq3_0_unpack_indices_device(const uint8_t * qp, uint8_t * idx) {
+    idx[0] =  qp[0]       & 7;
+    idx[1] = (qp[0] >> 3) & 7;
+    idx[2] = ((qp[0] >> 6) | (qp[1] << 2)) & 7;
+    idx[3] = (qp[1] >> 1) & 7;
+    idx[4] = (qp[1] >> 4) & 7;
+    idx[5] = ((qp[1] >> 7) | (qp[2] << 1)) & 7;
+    idx[6] = (qp[2] >> 2) & 7;
+    idx[7] = (qp[2] >> 5) & 7;
+}
+
+// TQ3_0: GPU-side 3-bit Lloyd-Max codebook quantization with RHT rotation
+static __device__ void quantize_f32_tq3_0_block(const float * __restrict__ x, block_tq3_0 * __restrict__ y) {
+    const float centroids[8] = {
+        -2.1519f, -1.3439f, -0.7560f, -0.2451f, 0.2451f, 0.7560f, 1.3439f, 2.1519f
+    };
+    const float boundaries[7] = {
+        -1.7479f, -1.0500f, -0.5005f, 0.0f, 0.5005f, 1.0500f, 1.7479f
+    };
+
+    // Compute RMS scale
+    float sum_sq = 0.0f;
+    for (int j = 0; j < QK_TQ3_0; j++) sum_sq += x[j] * x[j];
+    float rms = sqrtf(sum_sq / QK_TQ3_0);
+
+    memset(y, 0, sizeof(block_tq3_0));
+    y->d = __float2half(rms);
+
+    if (rms == 0.0f) return;
+
+    // Normalize and apply forward RHT
+    float rotated[QK_TQ3_0];
+    float inv_rms = 1.0f / rms;
+    for (int j = 0; j < QK_TQ3_0; j++) rotated[j] = x[j] * inv_rms;
+    tq3_wht32_forward_device(rotated);
+
+    // Quantize: boundary search and 3-bit pack
+    for (int g = 0; g < 4; g++) {
+        uint8_t idx[8];
+        for (int k = 0; k < 8; k++) {
+            float v = rotated[g * 8 + k];
+            uint8_t ci = 0;
+            for (int b = 0; b < 7; b++) {
+                if (v > boundaries[b]) ci = b + 1;
+            }
+            idx[k] = ci;
+        }
+        uint8_t * qp = y->qs + g * 3;
+        qp[0] = (idx[0]) | (idx[1] << 3) | (idx[2] << 6);
+        qp[1] = (idx[2] >> 2) | (idx[3] << 1) | (idx[4] << 4) | (idx[5] << 7);
+        qp[2] = (idx[5] >> 1) | (idx[6] << 2) | (idx[7] << 5);
+    }
+}
+
+static __device__ void cpy_blck_f32_tq3_0(const char * cxi, char * cdsti) {
+    quantize_f32_tq3_0_block((const float *)cxi, (block_tq3_0 *)cdsti);
+}
+
 template<typename src_t, typename dst_t>
 static __device__ void cpy_1_scalar(const char * cxi, char * cdsti) {
     *(dst_t *) cdsti = ggml_cuda_cast<dst_t>(*(const src_t *) cxi);

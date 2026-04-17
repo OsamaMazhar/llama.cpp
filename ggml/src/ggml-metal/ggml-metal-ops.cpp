@@ -2052,9 +2052,10 @@ int ggml_metal_op_mul_mat(ggml_metal_op_t ctx, int idx) {
            op->src[0]->type == GGML_TYPE_Q5_0 ||
            op->src[0]->type == GGML_TYPE_Q5_1 ||
            op->src[0]->type == GGML_TYPE_Q8_0 ||
-           op->src[0]->type == GGML_TYPE_MXFP4 ||
-           op->src[0]->type == GGML_TYPE_IQ4_NL ||
-           false) && (ne11 >= 2 && ne11 <= 8)
+            op->src[0]->type == GGML_TYPE_MXFP4 ||
+            op->src[0]->type == GGML_TYPE_IQ4_NL ||
+            op->src[0]->type == GGML_TYPE_TQ3_0 ||
+            false) && (ne11 >= 2 && ne11 <= 8)
          ) ||
          (
           (
@@ -2780,23 +2781,16 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         //
 #define FATTN_SMEM(nsg) (GGML_PAD((nqptg*(ne00 + 2*GGML_PAD(ne20, 64) + 2*(2*ncpsg)) + is_q*(16*32*(nsg)))*(sizeof(float)/2), 16))
 
-        //int64_t nsgmax = 4;
-        //
-        //if (is_q) {
-        //    nsgmax = 2;
-        //    while (true) {
-        //        const size_t smem = FATTN_SMEM(nsgmax);
-        //        if (smem > props_dev->max_theadgroup_memory_size) {
-        //            break;
-        //        }
-        //        nsgmax *= 2;
-        //    }
-        //    nsgmax /= 2;
-        //}
-
         // simdgroups per threadgroup (a.k.a. warps)
-        //nsg = ne01 <= nqptg ? MAX(4, MIN(nsgmax, MIN(ne11/ncpsg, (int64_t) pipeline.maxTotalThreadsPerThreadgroup/32))) : 4;
+        // Start with the preferred nsg: 8 for large head dims (dk>=512, e.g. Gemma 4 global
+        // attention layers), 4 otherwise. Then clamp down if the resulting threadgroup memory
+        // exceeds the device limit. On iOS, maxThreadgroupMemoryLength == 32768 bytes; with
+        // dk=512 and nsg=8 the FATTN_SMEM is 36864 bytes which trips the Metal validation
+        // layer. With nsg=4 it drops to exactly 32768 bytes and fits on every Apple GPU.
         int32_t nsg = ne00 >= 512 ? 8 : 4;
+        while (nsg > 1 && FATTN_SMEM(nsg) > props_dev->max_theadgroup_memory_size) {
+            nsg /= 2;
+        }
 
         const size_t smem = FATTN_SMEM(nsg);
 
@@ -2918,7 +2912,9 @@ int ggml_metal_op_flash_attn_ext(ggml_metal_op_t ctx, int idx) {
         // ne20*(nsg)
         // each simdgroup has a full f32 head vector in shared mem to accumulate results
         //
-#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg))*(sizeof(float)/2), 16))
+        // For TQ3_0, add extra space for WHT cache: 32 floats per simdgroup (shared between K and V)
+#define FATTN_SMEM(nsg) (GGML_PAD(((GGML_PAD(ne00, 128) + 4*ncpsg + 2*GGML_PAD(ne20, 128))*(nsg) + \
+                                    (op->src[1]->type == GGML_TYPE_TQ3_0 ? 32*(nsg) : 0))*(sizeof(float)/2), 16))
 
         int64_t nsg = 1;
 
