@@ -1267,3 +1267,72 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
 }
+
+// TurboQuant TQ3_0: Fused MMVQ with per-block RHT on query
+// K is stored in RHT-rotated space. We apply RHT to Q inside the kernel.
+// Since RHT is orthogonal: dot(q, k) = dot(RHT(q), RHT(k))
+// Both 1/sqrt(32) normalizations combine to 1/32.
+#define VDR_TQ3_0_Q8_1_MMVQ 8
+#define VDR_TQ3_0_Q8_1_MMQ  8
+
+static __device__ __forceinline__ float vec_dot_tq3_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+
+    const float centroids[8] = {
+        -2.1519f, -1.3439f, -0.7560f, -0.2451f, 0.2451f, 0.7560f, 1.3439f, 2.1519f
+    };
+    const int8_t signs[32] = {
+        +1, -1, +1, -1, +1, +1, -1, +1, -1, -1, +1, +1, -1, +1, +1, -1,
+        +1, +1, -1, -1, +1, -1, +1, +1, -1, +1, -1, +1, +1, -1, -1, +1
+    };
+
+    if (iqs != 0) {
+        return 0.0f;
+    }
+
+    const block_tq3_0 * btq = (const block_tq3_0 *) vbq + kbx;
+    const float d = __half2float(btq->d);
+
+    // Step 1: Apply RHT to Q8_1 int8 values (sign flip + butterfly in int32)
+    int32_t sq[32];
+    #pragma unroll
+    for (int j = 0; j < 32; j++) {
+        sq[j] = (int32_t)bq8_1[0].qs[j] * signs[j];
+    }
+
+    // 5-stage butterfly transform
+    #pragma unroll
+    for (int step = 1; step < 32; step <<= 1) {
+        #pragma unroll
+        for (int i = 0; i < 32; i += step * 2) {
+            #pragma unroll
+            for (int j = i; j < i + step; j++) {
+                int32_t a = sq[j], b = sq[j + step];
+                sq[j] = a + b; sq[j + step] = a - b;
+            }
+        }
+    }
+
+    // Step 2: Dot product in rotated space with 3-bit unpacking
+    float sumf = 0.0f;
+    #pragma unroll
+    for (int g = 0; g < 4; g++) {
+        const uint8_t * qp = btq->qs + g * 3;
+        uint8_t idx[8];
+        idx[0] =  qp[0]       & 7;
+        idx[1] = (qp[0] >> 3) & 7;
+        idx[2] = ((qp[0] >> 6) | (qp[1] << 2)) & 7;
+        idx[3] = (qp[1] >> 1) & 7;
+        idx[4] = (qp[1] >> 4) & 7;
+        idx[5] = ((qp[1] >> 7) | (qp[2] << 1)) & 7;
+        idx[6] = (qp[2] >> 2) & 7;
+        idx[7] = (qp[2] >> 5) & 7;
+        for (int k = 0; k < 8; k++) {
+            sumf += (float)sq[g * 8 + k] * centroids[idx[k]];
+        }
+    }
+
+    // Scale: d_tq3 * d_q8 / 32  (two 1/sqrt(32) normalizations combined)
+    const float d_q8 = __low2float(bq8_1[0].ds);
+    return sumf * d * d_q8 * 0.03125f;  // 0.03125 = 1/32
+}

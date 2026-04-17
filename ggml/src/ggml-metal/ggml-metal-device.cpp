@@ -671,7 +671,7 @@ ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext(ggml_
 ggml_metal_pipeline_with_params ggml_metal_library_get_pipeline_mul_mv_ext_tq3_0_cached(ggml_metal_library_t lib, ggml_type tsrc0, ggml_type tsrc1, int nsg, int nxpsg, int r1ptg, bool is_float4x4) {
     GGML_UNUSED(tsrc0);
     GGML_UNUSED(is_float4x4);
-    
+
     char base[256];
     char name[256];
 
