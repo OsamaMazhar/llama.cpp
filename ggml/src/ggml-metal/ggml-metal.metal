@@ -7450,19 +7450,23 @@ kernel void kernel_flash_attn_ext_vec_tq3_0(
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                     device const block_tq3_0 * pk = (device const block_tq3_0 *) (k + ((ic + NE*cc + ty)*args.nb11));
 
+                    short prev_block_idx = -1;
                     FOR_UNROLL (short ii = 0; ii < DK4/NL; ++ii) {
                         const short i = ii*NL + tx;
                         const short block_idx = i / 8;
 
-                        if (tiisg == 0) {
-                            float vals[32];
-                            tq3_0_dequant_block(pk + block_idx, vals);
-                            for (int j = 0; j < 32; j++) {
-                                k_wht_cache[j] = vals[j];
+                        if (block_idx != prev_block_idx) {
+                            simdgroup_barrier(mem_flags::mem_threadgroup);  // wait for prior reads
+                            if (tiisg == 0) {
+                                float vals[32];
+                                tq3_0_dequant_block(pk + block_idx, vals);
+                                for (int j = 0; j < 32; j++) {
+                                    k_wht_cache[j] = vals[j];
+                                }
                             }
+                            simdgroup_barrier(mem_flags::mem_threadgroup);  // wait for write
+                            prev_block_idx = block_idx;
                         }
-
-                        simdgroup_barrier(mem_flags::mem_threadgroup);
 
                         const short local_off = (i % 8) * 4;
                         float4 mk;
@@ -7536,19 +7540,23 @@ kernel void kernel_flash_attn_ext_vec_tq3_0(
                 FOR_UNROLL (short cc = 0; cc < C/NE; ++cc) {
                     device const block_tq3_0 * pv = (device const block_tq3_0 *) (v + ((ic + NE*cc + ty)*args.nb21));
 
+                    short prev_block_idx = -1;
                     FOR_UNROLL (short ii = 0; ii < DV4/NL; ++ii) {
                         const short i = ii*NL + tx;
                         const short block_idx = i / 8;
 
-                        if (tiisg == 0) {
-                            float vals[32];
-                            tq3_0_dequant_block(pv + block_idx, vals);
-                            for (int j = 0; j < 32; j++) {
-                                k_wht_cache[j] = vals[j];
+                        if (block_idx != prev_block_idx) {
+                            simdgroup_barrier(mem_flags::mem_threadgroup);  // wait for prior reads
+                            if (tiisg == 0) {
+                                float vals[32];
+                                tq3_0_dequant_block(pv + block_idx, vals);
+                                for (int j = 0; j < 32; j++) {
+                                    k_wht_cache[j] = vals[j];
+                                }
                             }
+                            simdgroup_barrier(mem_flags::mem_threadgroup);  // wait for write
+                            prev_block_idx = block_idx;
                         }
-
-                        simdgroup_barrier(mem_flags::mem_threadgroup);
 
                         const short local_off = (i % 8) * 4;
                         float4 mv;
@@ -7662,6 +7670,9 @@ template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk128_dv128")]] kernel fla
 template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk192_dv192")]] kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 192, 192, 2, 4, 16>;
 template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk192_dv128")]] kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 192, 128, 2, 4, 16>;
 template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk256_dv256")]] kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 256, 256, 1, 4, 16>;
+template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk320_dv256")]] kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 320, 256, 2, 4, 16>;
+template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk512_dv512")]] kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 512, 512, 1, 4, 16>;
+template [[host_name("kernel_flash_attn_ext_vec_tq3_0_dk576_dv512")]] kernel flash_attn_ext_vec_tq3_0_t kernel_flash_attn_ext_vec_tq3_0<half4, half, half, half4, half4, 576, 512, 2, 4, 16>;
 
 constant int32_t FC_flash_attn_ext_vec_reduce_DV  [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 0)]];
 constant int32_t FC_flash_attn_ext_vec_reduce_NWG [[function_constant(FC_FLASH_ATTN_EXT_VEC_REDUCE + 1)]];
